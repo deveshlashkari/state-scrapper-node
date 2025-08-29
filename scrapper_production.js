@@ -1,18 +1,21 @@
-// scraper_production.js
 /**
- * Production-ready scraper for major states/cities using Serper places API.
- * - Save this as scraper_production.js
- * - npm install axios cheerio validator
- * - Set SERPER_API_KEY env var (required)
+ * scraper_production.js
  *
- * Features:
- *  - concurrency control
- *  - retries with exponential backoff
- *  - UA rotation
- *  - homepage/contact/about fallback scraping
- *  - streaming CSV append with header
- *  - persistent dedupe (stored to disk)
- *  - graceful shutdown
+ * Production-ready scraper:
+ * - Primary source: YellowPages (structured)
+ * - Fallback: Serper Places API (requires SERPER_API_KEY env secret)
+ * - Visits websites to extract emails (cheerio + validator)
+ * - Streaming CSV append, persistent dedupe (dedupe.json)
+ * - Retries, exponential backoff, timeouts
+ * - ETA and progress logging
+ *
+ * Usage:
+ *   export SERPER_API_KEY=xxxxx
+ *   node scraper_production.js
+ *
+ * Notes:
+ * - Running on GitHub Actions: set repository secret SERPER_API_KEY
+ * - Large runs may take long; this is safe to run in scheduled CI
  */
 
 const axios = require("axios");
@@ -22,82 +25,19 @@ const crypto = require("crypto");
 const cheerio = require("cheerio");
 const validator = require("validator");
 
-// ======= CONFIG (via env) =======
-const API_KEY = process.env.SERPER_API_KEY || "";
-if (!API_KEY) {
-  console.error("Error: SERPER_API_KEY environment variable is required.");
-  process.exit(1);
-}
-
+// ---------------- CONFIG ----------------
+const API_KEY = process.env.SERPER_API_KEY || ""; // optional but recommended for fallback
 const OUTPUT_FILE = process.env.OUTPUT_FILE || "businesses.csv";
-const DEKUPE_FILE = process.env.DEDUPE_FILE || "dedupe.json"; // persistent dedupe store
-const MAX_PAGES = Number(process.env.MAX_PAGES || 2);
-const API_CONCURRENCY = Number(process.env.API_CONCURRENCY || 6); // parallel place queries
-const SITE_CONCURRENCY = Number(process.env.SITE_CONCURRENCY || 12); // parallel website scrapes
+const DEDUPE_FILE = process.env.DEDUPE_FILE || "dedupe.json";
+const MAX_PAGES = Number(process.env.MAX_PAGES || 2); // pages per query - YP uses page param
+const SITE_CONCURRENCY = Number(process.env.SITE_CONCURRENCY || 8);
+const API_CONCURRENCY = Number(process.env.API_CONCURRENCY || 4);
+const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT_MS || 15000);
 const PER_REQUEST_DELAY_MS = Number(process.env.PER_REQUEST_DELAY_MS || 150);
-const REQUEST_TIMEOUT = Number(process.env.REQUEST_TIMEOUT_MS || 15_000);
-const SKIP_SCRAPING_IF_NO_WEBSITE =
-  process.env.SKIP_SCRAPING_IF_NO_WEBSITE === "true";
+const MAX_RETRIES = Number(process.env.MAX_RETRIES || 3);
 
-// Default states + cities (major ones). You may override by setting STATE_LIST env to JSON string.
-const DEFAULT_STATES = {
-  California: [
-    "Los Angeles",
-    "San Francisco",
-    "San Diego",
-    "San Jose",
-    "Sacramento",
-  ],
-  Texas: ["Houston", "Dallas", "Austin", "San Antonio", "Fort Worth"],
-  Florida: ["Miami", "Tampa", "Orlando", "Jacksonville", "Tallahassee"],
-  NewYork: ["New York City", "Buffalo", "Rochester", "Albany", "Syracuse"],
-  Illinois: ["Chicago", "Aurora", "Naperville", "Joliet", "Rockford"],
-  Arizona: ["Phoenix", "Tucson", "Mesa", "Scottsdale", "Chandler"],
-};
-
-let STATES;
-try {
-  STATES = process.env.STATE_LIST
-    ? JSON.parse(process.env.STATE_LIST)
-    : DEFAULT_STATES;
-} catch (err) {
-  console.warn("STATE_LIST env invalid JSON — using defaults.");
-  STATES = DEFAULT_STATES;
-}
-
-// Business types to search (tweak if desired)
-const BUSINESS_TYPES = [
-  "restaurants",
-  "coffee shops",
-  "hair salons",
-  "dentist offices",
-  "auto repair shops",
-  "bakeries",
-  "pharmacies",
-  "bookstores",
-  "florists",
-  "veterinary clinics",
-  "shoe stores",
-];
-
-// ======= Helpers =======
-function sleep(ms) {
-  return new Promise((res) => setTimeout(res, ms));
-}
-function md5(s) {
-  return crypto.createHash("md5").update(s).digest("hex");
-}
-function csvEscape(value) {
-  if (value === null || value === undefined) return "";
-  const s = String(value);
-  if (s.includes('"') || s.includes(",") || s.includes("\n")) {
-    return `"${s.replace(/"/g, '""')}"`;
-  }
-  return s;
-}
-
-// ======= User Agents (rotate) =======
-const UAS = [
+// ---------------- User-agent rotation ----------------
+const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36",
   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.5938.92 Safari/537.36",
@@ -105,21 +45,127 @@ const UAS = [
 ];
 let uaIndex = 0;
 function nextUA() {
-  uaIndex = (uaIndex + 1) % UAS.length;
-  return UAS[uaIndex];
+  uaIndex = (uaIndex + 1) % USER_AGENTS.length;
+  return USER_AGENTS[uaIndex];
 }
 
-// ======= HTTP clients =======
-const apiClient = axios.create({
-  timeout: REQUEST_TIMEOUT,
-  headers: { "Content-Type": "application/json" },
-});
+// ---------------- States & cities (50 states, each with some major cities) ----------------
+// This list targets major population centers, not every town.
+const STATE_CITY_MAP = {
+  Alabama: ["Birmingham", "Montgomery", "Mobile"],
+  Alaska: ["Anchorage", "Fairbanks"],
+  Arizona: ["Phoenix", "Tucson", "Mesa"],
+  Arkansas: ["Little Rock", "Fayetteville"],
+  California: [
+    "Los Angeles",
+    "San Francisco",
+    "San Diego",
+    "Sacramento",
+    "San Jose",
+  ],
+  Colorado: ["Denver", "Colorado Springs", "Aurora"],
+  Connecticut: ["Bridgeport", "New Haven", "Hartford"],
+  Delaware: ["Wilmington", "Dover"],
+  Florida: ["Miami", "Orlando", "Tampa", "Jacksonville"],
+  Georgia: ["Atlanta", "Savannah", "Augusta"],
+  Hawaii: ["Honolulu"],
+  Idaho: ["Boise", "Idaho Falls"],
+  Illinois: ["Chicago", "Aurora", "Naperville"],
+  Indiana: ["Indianapolis", "Fort Wayne"],
+  Iowa: ["Des Moines", "Cedar Rapids"],
+  Kansas: ["Wichita", "Overland Park"],
+  Kentucky: ["Louisville", "Lexington"],
+  Louisiana: ["New Orleans", "Baton Rouge"],
+  Maine: ["Portland"],
+  Maryland: ["Baltimore", "Annapolis"],
+  Massachusetts: ["Boston", "Worcester"],
+  Michigan: ["Detroit", "Grand Rapids", "Ann Arbor"],
+  Minnesota: ["Minneapolis", "Saint Paul"],
+  Mississippi: ["Jackson"],
+  Missouri: ["St. Louis", "Kansas City"],
+  Montana: ["Billings"],
+  Nebraska: ["Omaha", "Lincoln"],
+  Nevada: ["Las Vegas", "Reno"],
+  NewHampshire: ["Manchester"],
+  NewJersey: ["Newark", "Jersey City"],
+  NewMexico: ["Albuquerque", "Santa Fe"],
+  NewYork: ["New York City", "Buffalo", "Rochester"],
+  NorthCarolina: ["Charlotte", "Raleigh", "Durham"],
+  NorthDakota: ["Fargo"],
+  Ohio: ["Columbus", "Cleveland", "Cincinnati"],
+  Oklahoma: ["Oklahoma City", "Tulsa"],
+  Oregon: ["Portland", "Eugene"],
+  Pennsylvania: ["Philadelphia", "Pittsburgh", "Harrisburg"],
+  RhodeIsland: ["Providence"],
+  SouthCarolina: ["Charleston", "Columbia"],
+  SouthDakota: ["Sioux Falls"],
+  Tennessee: ["Nashville", "Memphis", "Knoxville"],
+  Texas: ["Houston", "Dallas", "Austin", "San Antonio"],
+  Utah: ["Salt Lake City", "Provo"],
+  Vermont: ["Burlington"],
+  Virginia: ["Richmond", "Virginia Beach"],
+  Washington: ["Seattle", "Spokane"],
+  WestVirginia: ["Charleston"],
+  Wisconsin: ["Milwaukee", "Madison"],
+  Wyoming: ["Cheyenne"],
+};
+
+// ---------------- Business categories (expanded) ----------------
+const BUSINESS_TYPES = [
+  "restaurants",
+  "coffee shops",
+  "bakeries",
+  "hair salons",
+  "barbershops",
+  "dentist offices",
+  "doctors clinics",
+  "pharmacies",
+  "veterinary clinics",
+  "pet shops",
+  "shoe stores",
+  "auto repair shops",
+  "plumbers",
+  "electricians",
+  "dry cleaners",
+  "florists",
+  "bookstores",
+  "jewelry stores",
+  "lawyers",
+  "accountants",
+];
+
+// ---------------- Utilities ----------------
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+function md5(s) {
+  return crypto.createHash("md5").update(s).digest("hex");
+}
+function csvEscape(v) {
+  if (v === null || v === undefined) return "";
+  const s = String(v);
+  if (s.includes('"') || s.includes(",") || s.includes("\n")) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+// ---------------- HTTP clients ----------------
+const apiClient = axios.create({ timeout: REQUEST_TIMEOUT });
 const siteClient = axios.create({ timeout: REQUEST_TIMEOUT, maxRedirects: 5 });
 
-// ======= CSV streaming utilities =======
+// ---------------- CSV streaming & dedupe ----------------
 function ensureCsvHeader() {
-  const headers = ["name", "website", "email", "businessType", "city", "state"];
   if (!fs.existsSync(OUTPUT_FILE) || fs.statSync(OUTPUT_FILE).size === 0) {
+    const headers = [
+      "name",
+      "phone",
+      "website",
+      "email",
+      "businessType",
+      "city",
+      "state",
+    ];
     fs.writeFileSync(
       OUTPUT_FILE,
       headers.map(csvEscape).join(",") + "\n",
@@ -129,57 +175,114 @@ function ensureCsvHeader() {
 }
 function appendRows(rows) {
   if (!rows || rows.length === 0) return;
-  const lines = rows
-    .map((r) =>
-      [
-        csvEscape(r.name),
-        csvEscape(r.website || ""),
-        csvEscape(r.email || ""),
-        csvEscape(r.businessType || ""),
-        csvEscape(r.city || ""),
-        csvEscape(r.state || ""),
-      ].join(",")
-    )
-    .join("\n");
-  fs.appendFileSync(OUTPUT_FILE, lines + "\n", "utf8");
+  const lines =
+    rows
+      .map((r) =>
+        [
+          csvEscape(r.name || ""),
+          csvEscape(r.phone || ""),
+          csvEscape(r.website || ""),
+          csvEscape(r.email || ""),
+          csvEscape(r.businessType || ""),
+          csvEscape(r.city || ""),
+          csvEscape(r.state || ""),
+        ].join(",")
+      )
+      .join("\n") + "\n";
+  fs.appendFileSync(OUTPUT_FILE, lines, "utf8");
 }
 
-// ======= Persistent dedupe (simple disk-backed JSON of MD5 keys) =======
 let dedupeSet = new Set();
 function loadDedupe() {
   try {
-    if (fs.existsSync(DEKUPE_FILE)) {
-      const raw = fs.readFileSync(DEKUPE_FILE, "utf8");
-      const arr = JSON.parse(raw);
-      arr.forEach((k) => dedupeSet.add(k));
-      console.log(`Loaded ${dedupeSet.size} keys from ${DEKUPE_FILE}`);
+    if (fs.existsSync(DEDUPE_FILE)) {
+      const data = fs.readFileSync(DEDUPE_FILE, "utf8");
+      const arr = JSON.parse(data);
+      arr.forEach((x) => dedupeSet.add(x));
+      console.log(`Loaded ${dedupeSet.size} dedupe keys.`);
     }
-  } catch (err) {
-    console.warn("Failed loading dedupe file:", err.message);
+  } catch (e) {
+    console.warn("Could not load dedupe file:", e.message);
   }
 }
 function persistDedupe() {
   try {
-    fs.writeFileSync(DEKUPE_FILE, JSON.stringify([...dedupeSet]), "utf8");
+    fs.writeFileSync(DEDUPE_FILE, JSON.stringify([...dedupeSet]), "utf8");
+  } catch (e) {
+    console.warn("Could not persist dedupe file:", e.message);
+  }
+}
+setInterval(persistDedupe, 60_000);
+
+// ---------------- Networking helpers (retries/backoff) ----------------
+async function requestWithRetries(config, retries = MAX_RETRIES, delay = 1000) {
+  try {
+    const res = await axios(config);
+    return res;
   } catch (err) {
-    console.warn("Failed persisting dedupe file:", err.message);
+    if (retries > 0) {
+      await sleep(delay);
+      return requestWithRetries(config, retries - 1, delay * 2);
+    }
+    throw err;
   }
 }
 
-// Persist dedupe periodically
-setInterval(() => {
-  persistDedupe();
-}, 60_000);
+// ---------------- YellowPages scraping (structured) ----------------
+/**
+ * Scrape YellowPages search results for query & location.
+ * Returns array of { name, phone, website }.
+ */
+async function fetchYellowPages(query, city, state, page = 1) {
+  const geo = `${city}, ${state}`;
+  const url = `https://www.yellowpages.com/search?search_terms=${encodeURIComponent(
+    query
+  )}&geo_location_terms=${encodeURIComponent(geo)}&page=${page}`;
+  // Use Serper proxy? If SERPER not provided, directly fetch (may get blocked)
+  const useProxy = Boolean(API_KEY);
+  const finalUrl = useProxy
+    ? `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`
+    : url;
+  // NOTE: allorigins is a free CORS proxy — not guaranteed; if you have ScraperAPI/other proxy, replace here.
+  try {
+    const res = await requestWithRetries({
+      method: "get",
+      url: finalUrl,
+      timeout: REQUEST_TIMEOUT,
+      headers: { "User-Agent": nextUA() },
+    });
+    const html = res.data;
+    const $ = cheerio.load(html);
+    const results = [];
+    $(".result").each((i, el) => {
+      const name =
+        $(el).find(".business-name span").text().trim() ||
+        $(el).find(".business-name").text().trim();
+      const phone = $(el).find(".phones").first().text().trim();
+      // website link sometimes is direct, sometimes via track-visit-website
+      let website = $(el).find("a.track-visit-website").attr("href") || "";
+      if (website && website.startsWith("/biz_redirect?")) {
+        // YellowPages sometimes uses redirect links; try to pick data-visit
+        website =
+          $(el).find("a.track-visit-website").attr("data-visit") || website;
+      }
+      website = website ? website.trim() : "";
+      if (name) {
+        results.push({ name, phone, website });
+      }
+    });
+    const hasNext = $(".pagination a.next").length > 0;
+    return { results, hasNext };
+  } catch (err) {
+    // graceful fallback
+    // console.warn(`YP fetch failed for ${city}, ${state}: ${err.message}`);
+    return { results: [], hasNext: false };
+  }
+}
 
-// ======= Serper Places call with retries/backoff =======
-async function fetchPlaces(
-  city,
-  state,
-  businessType,
-  page = 1,
-  retries = 3,
-  delay = 1000
-) {
+// ---------------- Serper Places fallback ----------------
+async function fetchSerperPlaces(businessType, city, state, page = 1) {
+  if (!API_KEY) return [];
   const payload = JSON.stringify([
     {
       q: `${businessType} in ${city}`,
@@ -189,124 +292,106 @@ async function fetchPlaces(
     },
   ]);
   try {
-    const res = await apiClient.post(
-      "https://google.serper.dev/places",
-      payload,
+    const res = await requestWithRetries(
       {
-        headers: { "X-API-KEY": API_KEY, "Content-Type": "application/json" },
-      }
+        method: "post",
+        url: "https://google.serper.dev/places",
+        data: payload,
+        headers: { "Content-Type": "application/json", "X-API-KEY": API_KEY },
+      },
+      MAX_RETRIES,
+      1000
     );
     return res.data?.[0]?.places || [];
   } catch (err) {
-    if (retries > 0) {
-      console.warn(
-        `fetchPlaces error for ${city}/${businessType} page ${page}: ${err.message}. Retrying in ${delay}ms (${retries} left).`
-      );
-      await sleep(delay);
-      return fetchPlaces(
-        city,
-        state,
-        businessType,
-        page,
-        retries - 1,
-        delay * 2
-      );
-    }
-    console.error(
-      `fetchPlaces permanently failed for ${city}/${businessType} page ${page}: ${err.message}`
-    );
     return [];
   }
 }
 
-// ======= Email extraction from HTML =======
+// ---------------- Website scraping & email extraction ----------------
 function extractEmailsFromHtml(html) {
   const $ = cheerio.load(html || "");
-  const emails = new Set();
+  const found = new Set();
   $('a[href^="mailto:"]').each((i, el) => {
-    const href = $(el).attr("href");
-    if (!href) return;
-    const em = href
+    const m = $(el)
+      .attr("href")
       .replace(/^mailto:/i, "")
       .split("?")[0]
       .trim();
-    if (validator.isEmail(em)) emails.add(em.toLowerCase());
+    if (validator.isEmail(m)) found.add(m.toLowerCase());
   });
   const text = $("body").text() || "";
-  const regex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-  const found = text.match(regex) || [];
-  for (const e of found) {
-    if (validator.isEmail(e)) emails.add(e.toLowerCase());
-  }
-  return Array.from(emails);
+  const re = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const matches = text.match(re) || [];
+  matches.forEach((m) => {
+    if (validator.isEmail(m)) found.add(m.toLowerCase());
+  });
+  return Array.from(found);
 }
-
-// ======= Normalize URL & fetch with UA =======
+async function fetchHtmlUrl(url) {
+  const normalized = normalizeUrl(url);
+  if (!normalized) return null;
+  try {
+    const res = await requestWithRetries(
+      {
+        method: "get",
+        url: normalized,
+        timeout: REQUEST_TIMEOUT,
+        headers: { "User-Agent": nextUA() },
+      },
+      MAX_RETRIES,
+      800
+    );
+    return res.data;
+  } catch {
+    return null;
+  }
+}
 function normalizeUrl(u) {
   if (!u) return null;
   const t = u.trim();
   if (!/^https?:\/\//i.test(t)) return "http://" + t;
   return t;
 }
-async function fetchHtmlWithUA(url) {
-  try {
-    const ua = nextUA();
-    const res = await siteClient.get(url, {
-      headers: {
-        "User-Agent": ua,
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      },
-      validateStatus: (s) => s >= 200 && s < 400,
-    });
-    return res.data;
-  } catch {
-    return null;
-  }
-}
-
-// ======= Scrape site + fallback contact/about pages =======
-const SITE_PATHS = [
-  "/",
-  "/contact",
-  "/contact-us",
-  "/about",
-  "/about-us",
-  "/company",
-  "/info",
-];
 async function scrapeSiteForEmails(website) {
   if (!website) return [];
-  const root = normalizeUrl(website);
   const tried = new Set();
-  for (const p of SITE_PATHS) {
+  const paths = [
+    "/",
+    "/contact",
+    "/contact-us",
+    "/about",
+    "/about-us",
+    "/company",
+    "/info",
+  ];
+  for (const p of paths) {
     try {
-      const url = new URL(p, root).toString();
+      const url = new URL(p, normalizeUrl(website)).toString();
       if (tried.has(url)) continue;
       tried.add(url);
-      const html = await fetchHtmlWithUA(url);
+      const html = await fetchHtmlUrl(url);
       if (!html) continue;
       const emails = extractEmailsFromHtml(html);
       if (emails.length > 0) return emails;
-      await sleep(120); // small delay between site fetches
+      await sleep(120);
     } catch {
-      // skip invalid URL or network error
       continue;
     }
   }
   return [];
 }
 
-// ======= Async pool (concurrency) =======
-async function asyncPool(limit, tasks = [], handler) {
+// ---------------- Async pool (concurrency limiter) ----------------
+async function asyncPool(limit, items, iteratorFn) {
   const results = [];
   const executing = new Set();
-  for (const t of tasks) {
-    const p = Promise.resolve().then(() => handler(t));
+  for (const item of items) {
+    const p = Promise.resolve().then(() => iteratorFn(item));
     results.push(p);
     executing.add(p);
-    const onDone = () => executing.delete(p);
-    p.then(onDone).catch(onDone);
+    const clean = () => executing.delete(p);
+    p.then(clean).catch(clean);
     if (executing.size >= limit) {
       await Promise.race(executing);
     }
@@ -314,142 +399,188 @@ async function asyncPool(limit, tasks = [], handler) {
   return Promise.all(results);
 }
 
-// ======= Graceful shutdown =======
+// ---------------- Progress / Stats ----------------
+let stats = {
+  tasksTotal: 0,
+  tasksCompleted: 0,
+  websitesFetched: 0,
+  emailsFound: 0,
+  rowsAppended: 0,
+};
+
+function printProgress() {
+  const elapsed = (Date.now() - startTime) / 1000;
+  const tps = stats.tasksCompleted / Math.max(1, elapsed);
+  const remaining = Math.max(0, stats.tasksTotal - stats.tasksCompleted);
+  const eta =
+    tps > 0
+      ? new Date(Math.round((remaining / tps) * 1000))
+          .toISOString()
+          .substr(11, 8)
+      : "Calculating";
+  console.log(
+    `\n=== PROGRESS: ${stats.tasksCompleted}/${stats.tasksTotal} tasks — ETA ${eta} ===`
+  );
+  console.log(
+    `websites fetched: ${stats.websitesFetched} | emails found: ${stats.emailsFound} | rows appended: ${stats.rowsAppended}`
+  );
+}
+
+// ---------------- Graceful shutdown ----------------
 let shuttingDown = false;
 process.on("SIGINT", () => {
-  console.log(
-    "SIGINT received — will shutdown gracefully after current tasks finish..."
-  );
+  console.log("SIGINT received — finishing current work then exit");
   shuttingDown = true;
 });
 process.on("SIGTERM", () => {
-  console.log(
-    "SIGTERM received — will shutdown gracefully after current tasks finish..."
-  );
+  console.log("SIGTERM received — finishing current work then exit");
   shuttingDown = true;
 });
 
-// ======= Main pipeline =======
-async function main() {
-  ensureCsvHeader();
-  loadDedupe();
+// ---------------- Main pipeline ----------------
+ensureCsvHeader();
+loadDedupe();
 
-  // build task list
-  const cityTuples = [];
-  for (const [state, cityList] of Object.entries(STATES)) {
-    for (const city of cityList) cityTuples.push({ city, state });
-  }
-  const totalTasks = cityTuples.length * BUSINESS_TYPES.length;
-  let completedTasks = 0;
-  const start = Date.now();
-
-  for (const { city, state } of cityTuples) {
-    if (shuttingDown) break;
-    console.log(`\n=== Processing city: ${city}, ${state} ===`);
-    for (const businessType of BUSINESS_TYPES) {
-      if (shuttingDown) break;
-      completedTasks++;
-      const elapsed = (Date.now() - start) / 1000;
-      const tps = completedTasks / Math.max(1, elapsed);
-      const remaining = totalTasks - completedTasks;
-      const eta = isFinite(tps)
-        ? new Date(Math.round((remaining / tps) * 1000))
-            .toISOString()
-            .substr(11, 8)
-        : "Calculating";
-      console.log(
-        `[${completedTasks}/${totalTasks}] ${businessType} in ${city}, ${state} — ETA ${eta}`
-      );
-
-      // small spacing between API calls
-      await sleep(PER_REQUEST_DELAY_MS);
-
-      // fetch pages
-      let places = [];
-      for (let page = 1; page <= MAX_PAGES; page++) {
-        if (shuttingDown) break;
-        console.log(`  fetching page ${page}...`);
-        const pagePlaces = await fetchPlaces(city, state, businessType, page);
-        if (!pagePlaces || pagePlaces.length === 0) {
-          if (page === 1) console.log("  no results or error for first page.");
-          break;
-        }
-        places.push(...pagePlaces);
-        await sleep(120);
-      }
-
-      console.log(`  fetched ${places.length} candidate places.`);
-
-      // create tasks for each place
-      const tasks = places.map((place) => async () => {
-        if (shuttingDown) return null;
-        // normalize name
-        const name = (place.title || place.name || "").trim() || "Unknown";
-        const website = place.website || place.url || "";
-        const key = md5(`${name}|${city}|${state}`);
-        if (dedupeSet.has(key)) {
-          // skip
-          return null;
-        }
-
-        // primary email if present in API
-        let emails = [];
-        try {
-          if (place.email && validator.isEmail(place.email)) {
-            emails = [place.email.toLowerCase()];
-          } else if (website && !SKIP_SCRAPING_IF_NO_WEBSITE) {
-            emails = await scrapeSiteForEmails(website);
-          } else {
-            // no website -> keep emails empty
-          }
-        } catch (err) {
-          emails = [];
-        }
-        if (emails.length === 0) emails = [""]; // maintain shape
-
-        const rows = emails.map((em) => ({
-          name,
-          website: website || "",
-          email: em || "",
-          businessType,
-          city,
-          state,
-        }));
-
-        dedupeSet.add(key);
-        return rows;
-      });
-
-      // run place tasks with concurrency (site scrapes)
-      const results = await asyncPool(SITE_CONCURRENCY, tasks, (t) => t());
-      // flatten results and append
-      const newRows = [];
-      for (const r of results) {
-        if (Array.isArray(r) && r.length) newRows.push(...r);
-      }
-
-      if (newRows.length > 0) {
-        appendRows(newRows);
-        console.log(
-          `  appended ${newRows.length} rows (dedupe total ≈ ${dedupeSet.size})`
-        );
-      } else {
-        console.log("  no new rows for this batch.");
-      }
-
-      // small pause between business types to reduce burstiness
-      await sleep(100);
-    } // end businessTypes
-  } // end cities
-
-  // final persist dedupe
-  persistDedupe();
-  console.log("\n✅ Scraping run complete.");
-  console.log(`Total deduped entries: ${dedupeSet.size}`);
+const cityTuples = [];
+for (const [state, cities] of Object.entries(STATE_CITY_MAP)) {
+  for (const city of cities) cityTuples.push({ city, state });
 }
+stats.tasksTotal = cityTuples.length * BUSINESS_TYPES.length;
+const startTime = Date.now();
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  persistDedupe();
-  process.exit(1);
-});
+(async () => {
+  try {
+    for (const { city, state } of cityTuples) {
+      if (shuttingDown) break;
+      console.log(`\n--- Processing ${city}, ${state} ---`);
+      for (const businessType of BUSINESS_TYPES) {
+        if (shuttingDown) break;
+        console.log(`\n[Task] ${businessType} in ${city}, ${state}`);
+        // small throttling between tasks
+        await sleep(PER_REQUEST_DELAY_MS);
+
+        // 1) Primary: YellowPages structured search across pages
+        let places = [];
+        for (let page = 1; page <= MAX_PAGES; page++) {
+          const { results, hasNext } = await fetchYellowPages(
+            businessType,
+            city,
+            state,
+            page
+          );
+          if (results && results.length) {
+            places.push(...results);
+          }
+          if (!hasNext) break;
+          await sleep(120);
+        }
+
+        // 2) Fallback: Serper Places (if no YP results)
+        if (places.length === 0 && API_KEY) {
+          const serperPlaces = await fetchSerperPlaces(
+            businessType,
+            city,
+            state,
+            1
+          );
+          // serper places have different shape; normalize
+          for (const p of serperPlaces) {
+            places.push({
+              name: p.title || p.name || "",
+              phone: p.phone || "",
+              website: p.website || p.url || "",
+              _serper_raw: p,
+            });
+          }
+        }
+
+        console.log(`  Candidate places: ${places.length}`);
+
+        // Build per-place tasks that visit website & extract emails
+        const placeTasks = places.map((pl) => async () => {
+          if (shuttingDown) return null;
+          // Normalize fields
+          const name = (pl.name || pl.title || "").trim() || "Unknown";
+          const phone = pl.phone || "";
+          const website = (pl.website || pl.url || "").trim();
+          const key = md5(`${name}|${city}|${state}`);
+          if (dedupeSet.has(key)) return null;
+
+          // Try to get emails: first from Serper if present, else scrape site
+          let emails = [];
+          try {
+            // if pl has _serper_raw and email inside
+            if (
+              pl._serper_raw &&
+              pl._serper_raw.email &&
+              validator.isEmail(pl._serper_raw.email)
+            ) {
+              emails = [pl._serper_raw.email.toLowerCase()];
+            } else if (website) {
+              const found = await scrapeSiteForEmails(website);
+              if (found && found.length) emails = found;
+              stats.websitesFetched++;
+            }
+          } catch (e) {
+            // ignore site-level errors
+          }
+
+          if (!emails || emails.length === 0) emails = [""];
+
+          // produce rows
+          const rows = emails.map((em) => ({
+            name,
+            phone,
+            website,
+            email: em || "",
+            businessType,
+            city,
+            state,
+          }));
+
+          // mark dedupe
+          dedupeSet.add(key);
+          return rows;
+        });
+
+        // Run place tasks with concurrency
+        const results = await asyncPool(SITE_CONCURRENCY, placeTasks, (t) =>
+          t()
+        );
+        const newRows = [];
+        for (const r of results) {
+          if (Array.isArray(r) && r.length) {
+            newRows.push(...r);
+          }
+        }
+
+        if (newRows.length > 0) {
+          appendRows(newRows);
+          stats.rowsAppended += newRows.length;
+          const foundEmails = newRows.filter(
+            (r) => r.email && r.email.length > 0
+          ).length;
+          stats.emailsFound += foundEmails;
+          console.log(
+            `  Appended ${newRows.length} rows (emails found: ${foundEmails})`
+          );
+        } else {
+          console.log("  No new rows for this batch.");
+        }
+
+        stats.tasksCompleted++;
+        printProgress();
+
+        // small pause to reduce burstiness
+        await sleep(120);
+      } // end business types
+      // persist dedupe after each city
+      persistDedupe();
+    } // end cities
+  } catch (err) {
+    console.error("Fatal pipeline error:", err);
+  } finally {
+    persistDedupe();
+    console.log("\n✅ Scrape finished. Final stats:", stats);
+  }
+})();
